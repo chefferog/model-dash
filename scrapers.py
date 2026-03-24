@@ -15,6 +15,50 @@ HEADERS = {
 
 TIMEOUT = 20
 
+# ── Model quality filters ──────────────────────────────────────────────────────
+# Patterns that indicate the model is NOT a text-generation LLM
+_NON_LLM = re.compile(
+    r"\bembed"               # embedding/retrieval models (prefix match covers embedqa, embeddings, etc.)
+    r"|\btts\b|-tts\b"       # text-to-speech
+    r"|native-audio"          # audio-only models
+    r"|-image\b|image-preview"# image-generation models (e.g. gemini-2.5-flash-image)
+    r"|computer-use"          # specialized tool-use variants (not general-purpose LLMs)
+    r"|\breward\b"            # reward / preference models
+    r"|safety-guard|nemoguard"# content safety classifiers
+    r"|\bpii\b|gliner"        # PII / NER classifiers
+    r"|diffusion"             # diffusion image models
+    r"|whisper|speech-to-text"# ASR models
+    r"|\bclip\b"              # vision-only encoders
+    r"|\bretriev"             # retriever / reranker models
+    r"|\btranslat"            # translation-only models
+    r"|streampetr|\bvila\b"   # non-LLM vision/tracking models
+    ,
+    re.IGNORECASE,
+)
+
+# Patterns that indicate a model is legacy or archived
+_LEGACY = re.compile(
+    r"\blegacy\b|\barchived\b|\bdeprecated\b"
+    r"|davinci|babbage|curie|text-ada"  # OpenAI legacy completions
+    r"|gpt-3\.5"                        # OpenAI older generation
+    ,
+    re.IGNORECASE,
+)
+
+
+def is_llm(model_id: str) -> bool:
+    """Return True if the model ID looks like a text-generation LLM."""
+    return not _NON_LLM.search(model_id)
+
+
+def is_current(model_id: str) -> bool:
+    """Return True if the model is not marked legacy/archived/deprecated."""
+    return not _LEGACY.search(model_id)
+
+
+def keep(model_id: str) -> bool:
+    return is_llm(model_id) and is_current(model_id)
+
 
 # ── Anthropic ──────────────────────────────────────────────────────────────────
 async def fetch_anthropic():
@@ -35,19 +79,38 @@ async def fetch_anthropic():
             mid = mid.rstrip(".,/\"'")
             if any(mid.startswith(s) for s in skip):
                 continue
-            # Normalise: strip trailing -v\d+ alias so we don't show duplicates
+            # Normalize: strip trailing -v\d+ alias so we don't show duplicates
             base = re.sub(r"-v\d+$", "", mid)
             if base not in seen_bases and len(base) > 8:
                 seen_bases.add(base)
                 models.append({"id": base, "name": base})
 
-        # Sort by date stamp desc (newer first)
-        def sort_key(m):
-            match = re.search(r"(\d{8})", m["id"])
-            return match.group() if match else "0"
+        models = [m for m in models if keep(m["id"])]
 
-        models.sort(key=sort_key, reverse=True)
-        return models[:8] if models else _fallback_anthropic()
+        # Keep only the latest version per model family (opus, sonnet, haiku, …)
+        # Version key: (major, minor, date) — all extracted from the model ID
+        def version_key(model_id):
+            family_m = re.search(r"claude-(opus|sonnet|haiku|instant)", model_id, re.IGNORECASE)
+            after = model_id[family_m.end():] if family_m else model_id
+            date_m = re.search(r"(\d{8})", after)
+            date = int(date_m.group(1)) if date_m else 0
+            ver_nums = [int(n) for n in re.findall(r"\d+", after) if len(n) < 8]
+            major = ver_nums[0] if len(ver_nums) > 0 else 0
+            minor = ver_nums[1] if len(ver_nums) > 1 else 0
+            return (major, minor, date)
+
+        def family_name(model_id):
+            m = re.search(r"claude-(opus|sonnet|haiku|instant)", model_id, re.IGNORECASE)
+            return m.group(1).lower() if m else model_id
+
+        best = {}  # family → model with highest version key
+        for m in models:
+            fam = family_name(m["id"])
+            if fam not in best or version_key(m["id"]) > version_key(best[fam]["id"]):
+                best[fam] = m
+
+        result = sorted(best.values(), key=lambda m: version_key(m["id"]), reverse=True)
+        return result if result else _fallback_anthropic()
     except Exception:
         return _fallback_anthropic()
 
@@ -57,9 +120,9 @@ def _fallback_anthropic():
         {"id": "claude-opus-4-6",              "name": "Claude Opus 4.6"},
         {"id": "claude-sonnet-4-6",             "name": "Claude Sonnet 4.6"},
         {"id": "claude-haiku-4-5-20251001",     "name": "Claude Haiku 4.5"},
-        {"id": "claude-3-5-sonnet-20241022",    "name": "Claude 3.5 Sonnet"},
-        {"id": "claude-3-5-haiku-20241022",     "name": "Claude 3.5 Haiku"},
-        {"id": "claude-3-opus-20240229",        "name": "Claude 3 Opus"},
+        #{"id": "claude-3-5-sonnet-20241022",    "name": "Claude 3.5 Sonnet"},
+        #{"id": "claude-3-5-haiku-20241022",     "name": "Claude 3.5 Haiku"},
+        #{"id": "claude-3-opus-20240229",        "name": "Claude 3 Opus"},
     ]
 
 
@@ -86,6 +149,7 @@ async def fetch_openai():
                     seen.add(match)
                     models.append({"id": match, "name": match})
 
+        models = [m for m in models if keep(m["id"])]
         if models:
             return models[:8]
     except Exception:
@@ -136,9 +200,41 @@ async def fetch_google():
                     seen.add(m.lower())
                     models.append({"id": m, "name": m})
 
-        return models[:8] if models else _fallback_google()
+        models = [m for m in models if keep(m["id"])]
+        models = _latest_per_family_google(models)
+        return models if models else _fallback_google()
     except Exception:
         return _fallback_google()
+
+
+def _gemini_family_key(model_id):
+    """Return (family_name, (major, minor), is_preview) for a Gemini model ID."""
+    m = re.match(r"gemini-(\d+)\.(\d+)-(.*)", model_id, re.IGNORECASE)
+    if not m:
+        return None, (0, 0), True
+    major, minor, rest = int(m.group(1)), int(m.group(2)), m.group(3)
+    # Strip date-stamped preview suffix, then bare -preview
+    family = re.sub(r"-preview-\d{2}-\d{4}$", "", rest)
+    family = re.sub(r"-preview$", "", family)
+    is_preview = "preview" in rest
+    return family, (major, minor), is_preview
+
+
+def _latest_per_family_google(models):
+    """Keep one model per Gemini family (flash, flash-lite, pro, …), highest version wins.
+    At equal version, prefer non-preview over preview."""
+    best = {}  # family → (rank_tuple, model)
+    for m in models:
+        family, version, is_preview = _gemini_family_key(m["id"])
+        if not family:
+            continue
+        # Rank: (major, minor, 1 if stable else 0) — higher is better
+        rank = (version[0], version[1], 0 if is_preview else 1)
+        if family not in best or rank > best[family][0]:
+            best[family] = (rank, m)
+    result = [v[1] for v in best.values()]
+    result.sort(key=lambda m: _gemini_family_key(m["id"])[1], reverse=True)
+    return result
 
 
 def _fallback_google():
@@ -188,19 +284,49 @@ async def fetch_meta():
                 return (int(match.group(1)), int(match.group(2) or 0))
             return (0, 0)
 
-        models.sort(key=llama_sort, reverse=True)
-        return models[:6] if models else _fallback_meta()
+        models = [m for m in models if keep(m["id"])]
+        models = _latest_per_family_meta(models)
+        return models if models else _fallback_meta()
     except Exception:
         return _fallback_meta()
 
 
+def _meta_family_key(model_id):
+    """Return (family_name, (major, minor)) for a Meta Llama model ID.
+    Llama 4 variants (Maverick, Scout) are separate families.
+    Llama 3.x text and vision are separate families; only the latest minor is kept per type."""
+    major_m = re.search(r"llama-(\d+)", model_id, re.IGNORECASE)
+    major = int(major_m.group(1)) if major_m else 0
+    if major == 4:
+        series_m = re.search(r"llama-4-(\w+?)-", model_id, re.IGNORECASE)
+        series = series_m.group(1).lower() if series_m else "base"
+        return f"llama4-{series}", (4, 0)
+    elif major == 3:
+        minor_m = re.search(r"llama-3\.(\d+)", model_id, re.IGNORECASE)  # dot-separated minor only
+        minor = int(minor_m.group(1)) if minor_m else 0
+        cap = "vision" if "vision" in model_id.lower() else "text"
+        return f"llama3-{cap}", (3, minor)
+    return model_id, (0, 0)
+
+
+def _latest_per_family_meta(models):
+    """Keep the latest Llama model per capability family."""
+    best = {}
+    for m in models:
+        family, version = _meta_family_key(m["id"])
+        if family not in best or version > best[family][0]:
+            best[family] = (version, m)
+    result = [v[1] for v in best.values()]
+    result.sort(key=lambda m: _meta_family_key(m["id"])[1], reverse=True)
+    return result
+
+
 def _fallback_meta():
     return [
-        {"id": "Llama-3.3-70B-Instruct",          "name": "Llama 3.3 70B Instruct"},
-        {"id": "Llama-3.2-90B-Vision-Instruct",    "name": "Llama 3.2 90B Vision"},
-        {"id": "Llama-3.1-405B-Instruct",          "name": "Llama 3.1 405B Instruct"},
-        {"id": "Llama-3.2-11B-Vision-Instruct",    "name": "Llama 3.2 11B Vision"},
-        {"id": "Llama-Guard-3-8B",                 "name": "Llama Guard 3 8B"},
+        {"id": "Llama-4-Maverick-17B-128E-Instruct", "name": "Llama 4 Maverick"},
+        {"id": "Llama-4-Scout-17B-16E-Instruct",     "name": "Llama 4 Scout"},
+        {"id": "Llama-3.3-70B-Instruct",             "name": "Llama 3.3 70B Instruct"},
+        {"id": "Llama-3.2-90B-Vision-Instruct",      "name": "Llama 3.2 90B Vision"},
     ]
 
 
@@ -221,22 +347,60 @@ async def fetch_nvidia():
                         label = mid.split("/")[-1]
                         models.append({"id": mid, "name": label})
                 if models:
-                    # Prioritise Nemotron / Cosmos-Nemotron flagship models
-                    priority = [m for m in models if "nemotron" in m["name"] or "cosmos" in m["name"]]
-                    rest     = [m for m in models if m not in priority]
-                    return (priority + rest)[:8]
+                    # Restrict to NVIDIA's flagship LLM families: Nemotron and Cosmos Reason
+                    models = [m for m in models
+                              if keep(m["id"]) and
+                              ("nemotron" in m["name"] or "cosmos-reason" in m["name"])]
+                    models = _latest_per_family_nvidia(models)
+                    return models
     except Exception:
         pass
     return _fallback_nvidia()
 
 
+def _nvidia_tier(model_id):
+    """Return a tier label used to group Nemotron/Cosmos models into families."""
+    name = model_id.split("/")[-1]
+    if "cosmos-reason"    in name:   return "cosmos-reason"
+    if "nemotron-nano-vl" in name:   return "nemotron-nano-vl"
+    if "nemotron-nano"    in name:   return "nemotron-nano"
+    if "nemotron-super"   in name:   return "nemotron-super"
+    if "nemotron-ultra"   in name:   return "nemotron-ultra"
+    if "nemotron"         in name:   return "nemotron-instruct"
+    return name
+
+
+def _nvidia_rank(model_id):
+    """Rank key: (llama_major, llama_minor, ver_major, ver_minor, param_billions).
+    Llama-based models (newer architecture) beat older standalone Nemotron models.
+    Within the same base, higher version and larger params win."""
+    llama_m  = re.search(r"llama-(\d+)\.(\d+)", model_id, re.IGNORECASE)
+    llama_v  = (int(llama_m.group(1)), int(llama_m.group(2))) if llama_m else (0, 0)
+    ver_m    = re.search(r"-v(\d+)(?:\.(\d+))?(?:\b|$)", model_id, re.IGNORECASE)
+    ver      = (int(ver_m.group(1)), int(ver_m.group(2) or 0)) if ver_m else (0, 0)
+    param_m  = re.search(r"-(\d+)b\b", model_id, re.IGNORECASE)
+    params   = int(param_m.group(1)) if param_m else 0
+    return llama_v + ver + (params,)
+
+
+def _latest_per_family_nvidia(models):
+    """Keep one model per Nemotron tier, preferring largest params then latest version."""
+    best = {}
+    for m in models:
+        tier = _nvidia_tier(m["id"])
+        rank = _nvidia_rank(m["id"])
+        if tier not in best or rank > best[tier][0]:
+            best[tier] = (rank, m)
+    return [v[1] for v in best.values()]
+
+
 def _fallback_nvidia():
     return [
-        {"id": "nvidia/llama-3.1-nemotron-70b-instruct",   "name": "Nemotron 70B Instruct"},
-        {"id": "nvidia/llama-3.3-nemotron-super-49b-v1",   "name": "Nemotron Super 49B"},
-        {"id": "nvidia/llama-3.1-nemotron-nano-8b-v1",     "name": "Nemotron Nano 8B"},
-        {"id": "nvidia/mistral-nemo-minitron-8b-8k-instruct", "name": "Minitron 8B Instruct"},
-        {"id": "nvidia/nv-embedqa-e5-v5",                  "name": "NV-EmbedQA E5"},
+        {"id": "nvidia/llama-3.1-nemotron-70b-instruct",      "name": "Nemotron 70B Instruct"},
+        {"id": "nvidia/llama-3.3-nemotron-super-49b-v1.5",    "name": "Nemotron Super 49B"},
+        {"id": "nvidia/llama-3.1-nemotron-ultra-253b-v1",     "name": "Nemotron Ultra 253B"},
+        {"id": "nvidia/llama-3.1-nemotron-nano-8b-v1",        "name": "Nemotron Nano 8B"},
+        {"id": "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",     "name": "Nemotron Nano VL 8B"},
     ]
 
 
@@ -271,6 +435,7 @@ async def fetch_mistral():
                         seen.add(m.lower())
                         models.append({"id": m, "name": m})
 
+        models = [m for m in models if keep(m["id"])]
         return models[:8] if models else _fallback_mistral()
     except Exception:
         return _fallback_mistral()
@@ -279,11 +444,10 @@ async def fetch_mistral():
 def _fallback_mistral():
     return [
         {"id": "mistral-large-2411",          "name": "Mistral Large (Nov 2024)"},
-        {"id": "mistral-small-2501",           "name": "Mistral Small (Jan 2025)"},
+        {"id": "mistral-small-2501",          "name": "Mistral Small (Jan 2025)"},
         {"id": "codestral-2501",              "name": "Codestral (Jan 2025)"},
         {"id": "pixtral-large-2411",          "name": "Pixtral Large (Nov 2024)"},
         {"id": "mixtral-8x22b-instruct-v0.1", "name": "Mixtral 8x22B Instruct"},
-        {"id": "mistral-embed",               "name": "Mistral Embed"},
     ]
 
 
