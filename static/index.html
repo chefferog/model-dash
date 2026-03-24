@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Model Dashboard</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div class="header-left">
+        <h1>AI Model Dashboard</h1>
+        <p class="subtitle">Latest frontier models across major providers</p>
+      </div>
+      <div class="header-right">
+        <div class="control-group">
+          <label for="pollInterval">Poll schedule</label>
+          <select id="pollInterval">
+            <option value="hourly">Hourly</option>
+            <option value="twice_daily">Twice daily</option>
+            <option value="daily" selected>Daily</option>
+          </select>
+        </div>
+        <button id="refreshBtn" class="btn-refresh">
+          <span id="refreshIcon">↻</span> Refresh
+        </button>
+        <div class="last-updated-wrap">
+          <span class="dot" id="statusDot"></span>
+          <span id="lastUpdated">Loading…</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="grid" id="modelGrid">
+      <!-- provider tiles injected here -->
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
